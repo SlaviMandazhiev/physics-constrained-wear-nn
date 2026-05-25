@@ -1,14 +1,19 @@
 """
-build_nn_feature_matrix_signal_thirds.py
+build_feature_matrix.py
 
-Builds an NN-ready feature matrix with 3 rows per Drehen by:
-  1. Splitting each Drehen's active force signal into 3 non-overlapping thirds
-  2. Computing statistical features on each third independently
-  3. Matching each third to one of 3 interpolated (cutting_length, VB) points
-     from VB_interpolated_all_samples_combined.xlsx
+Builds an ML-ready feature matrix from raw force signal files recorded
+during CNC turning experiments.
 
-This gives 3 genuinely independent feature vectors per Drehen, each paired
-with a different VB value along the monotone wear curve.
+Each turning pass (Drehen) is processed as follows:
+  1. The active cutting signal is extracted from the raw force recording.
+  2. The signal is split into 3 non-overlapping thirds.
+  3. Nine statistical features are computed per force axis (Fx, Fy, Fz)
+     for each third — 27 features per third, 3 rows per Drehen.
+  4. Each row is paired with an interpolated wear value (VB) from the
+     combined VB Excel file.
+
+Requires:
+  signal_processing.py  (must be in the same directory)
 """
 from __future__ import annotations
 
@@ -20,10 +25,17 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-from scipy.fft import rfft
-from scipy.stats import kurtosis, skew
 
-# Naming patterns  (same as build_nn_feature_matrix_corrected_final.py)
+from signal_processing import (
+    compute_features,
+    detect_force_columns,
+    read_table,
+    segment_active_signal,
+    split_into_thirds,
+)
+
+
+# ── Folder naming patterns ────────────────────────────────────────────────────
 
 OUTER_RUN_RE = re.compile(
     r"^spp2402_abr_wp_(?P<prefix>\d+)-(?P<reihe>Reihe-\d+)-(?P<system>(?:Mono|Bilay)-\d+)"
@@ -37,15 +49,17 @@ INNER_PC_RE = re.compile(
 DREHEN_RE = re.compile(r"^(?P<prefix>\d+)-Drehen(?P<idx>\d+)$", re.IGNORECASE)
 
 
+# ── Run metadata ─────────────────────────────────────────────────────────────
+
 @dataclass
 class RunMeta:
-    run_id_str: str
-    run_id_int: int
-    reihe: str          # e.g. "Reihe-1"
-    reihe_int: int      # e.g. 1
+    run_id_str:   str
+    run_id_int:   int
+    reihe:        str   # e.g. "Reihe-1"
+    reihe_int:    int   # e.g. 1
     schichtsystem: str  # e.g. "Mono-20"
-    sample_code: str    # e.g. "121-1"
-    run_dir: Path
+    sample_code:  str   # e.g. "121-1"
+    run_dir:      Path
 
     @property
     def sample_id(self) -> str:
@@ -53,26 +67,10 @@ class RunMeta:
 
     @property
     def vb_key(self) -> Tuple[int, str, str]:
-        """Key to look up rows in the combined VB xlsx."""
         return (self.reihe_int, self.schichtsystem, self.sample_code)
 
 
-# helpers
-
-def normalize_text(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
-
-
-def read_table(path: Path) -> pd.DataFrame:
-    ext = path.suffix.lower()
-    if ext == ".csv":
-        return pd.read_csv(path)
-    if ext in {".xls", ".xlsx"}:
-        return pd.read_excel(path)
-    raise ValueError(f"Unsupported file type: {path}")
-
-
-# folder walk
+# ── Folder discovery ──────────────────────────────────────────────────────────
 
 def find_run_dirs(runs_root: Path) -> List[RunMeta]:
     out: List[RunMeta] = []
@@ -82,7 +80,7 @@ def find_run_dirs(runs_root: Path) -> List[RunMeta]:
         m = OUTER_RUN_RE.match(child.name)
         if not m:
             continue
-        reihe_str = m.group("reihe")          # "Reihe-1"
+        reihe_str = m.group("reihe")
         reihe_num = int(reihe_str.split("-")[1])
         out.append(RunMeta(
             run_id_str=m.group("run_id"),
@@ -151,107 +149,15 @@ def find_signal_file(drehen_dir: Path) -> Path:
     return ranked[0][1]
 
 
-# column detection
-
-def detect_force_columns(df: pd.DataFrame) -> Dict[str, str]:
-    normalized = {normalize_text(c): c for c in df.columns}
-    out: Dict[str, str] = {}
-    for canonical in ("fx", "fy", "fz"):
-        if canonical in normalized:
-            out[canonical] = normalized[canonical]
-            continue
-        for key, orig in normalized.items():
-            if key.endswith(canonical) or key == f"force{canonical[-1]}":
-                out[canonical] = orig
-                break
-    return out
-
-# Signal segmentation
-
-def segment_active_signal(
-    signal: np.ndarray,
-    threshold: float = 150.0,
-    min_segment_length: int = 5000,
-    min_break_length: int = 100,
-    trim_samples: int = 1600,
-) -> np.ndarray:
-    signal = np.asarray(signal, dtype=float)
-    signal = signal[np.isfinite(signal)]
-    if signal.size == 0:
-        return np.array([], dtype=float)
-
-    active_indices = np.flatnonzero(np.abs(signal) > threshold)
-    if active_indices.size == 0:
-        return np.array([], dtype=float)
-
-    diffs = np.diff(active_indices)
-    breaks = np.where(diffs > min_break_length)[0]
-    starts = [active_indices[0]] + [active_indices[i + 1] for i in breaks]
-    ends   = [active_indices[i] for i in breaks] + [active_indices[-1]]
-
-    kept: List[np.ndarray] = []
-    for start, end in zip(starts, ends):
-        seg = signal[start:end + 1]
-        if len(seg) <= min_segment_length:
-            continue
-        if len(seg) <= 2 * trim_samples:
-            continue
-        kept.append(seg[trim_samples:-trim_samples])
-
-    if not kept:
-        return np.array([], dtype=float)
-    return np.concatenate(kept)
-
-
-def split_into_thirds(signal: np.ndarray) -> List[np.ndarray]:
-    """Split signal into 3 non-overlapping, roughly equal parts."""
-    n = len(signal)
-    b = [0, n // 3, 2 * n // 3, n]
-    return [signal[b[i]:b[i + 1]] for i in range(3)]
-
-# Feature calculation
-
-def safe_skew(x: np.ndarray) -> float:
-    if x.size < 3 or np.allclose(x, x[0]):
-        return 0.0
-    val = skew(x, bias=False)
-    return 0.0 if not np.isfinite(val) else float(val)
-
-
-def safe_kurtosis(x: np.ndarray) -> float:
-    if x.size < 4 or np.allclose(x, x[0]):
-        return 0.0
-    val = kurtosis(x, fisher=True, bias=False)
-    return 0.0 if not np.isfinite(val) else float(val)
-
-
-def compute_features(x: np.ndarray, prefix: str) -> Dict[str, float]:
-    x = np.asarray(x, dtype=float)
-    if x.size == 0:
-        raise ValueError("Cannot compute features on an empty segment.")
-    spec = np.abs(rfft(x))
-    return {
-        f"{prefix}_segment_length": float(len(x)),
-        f"{prefix}_mean":           float(np.mean(x)),
-        f"{prefix}_max":            float(np.max(x)),
-        f"{prefix}_min":            float(np.min(x)),
-        f"{prefix}_std":            float(np.std(x)),
-        f"{prefix}_kurtosis":       safe_kurtosis(x),
-        f"{prefix}_skewness":       safe_skew(x),
-        f"{prefix}_area_under_curve": float(np.trapz(x) if hasattr(np, 'trapz') else np.trapezoid(x)),
-        f"{prefix}_fft_energy":     float(np.sum(spec ** 2)),
-    }
-
-# VB lookup from combined xlsx
+# ── VB lookup ─────────────────────────────────────────────────────────────────
 
 def load_combined_vb(path: Path) -> pd.DataFrame:
     """
-    Load VB_interpolated_all_samples_combined.xlsx.
-    Expected columns: Sample_ID, Reihe, Schichtsystem,
-                      cutting_length_m, VB_fit_um, is_original, ...
+    Load the interpolated VB Excel file.
+    Required columns: Reihe, Schichtsystem, Sample_ID,
+                      cutting_length_m, VB_fit_um, is_original.
     """
-    df = pd.read_excel(path)
-    return df
+    return pd.read_excel(path)
 
 
 def get_all_drehen_vb_rows(
@@ -260,31 +166,28 @@ def get_all_drehen_vb_rows(
     rows_per_drehen: int = 3,
 ) -> List[pd.DataFrame]:
     """
-    Assign non-original interpolated VB rows to each Drehen positionally.
-    With endpoint=False in the interpolation, every interval contributes
-    exactly rows_per_drehen non-original rows — so positional grouping
-    is clean and robust regardless of stray extra rows in the xlsx.
+    Assign interpolated VB rows to each Drehen positionally.
+    Expects exactly rows_per_drehen non-original rows per Drehen interval.
     """
     non_orig = (
         sample_df[~sample_df["is_original"].astype(bool)]
         .sort_values("cutting_length_m")
         .reset_index(drop=True)
     )
-    result = []
-    for i in range(n_drehen):
-        start = i * rows_per_drehen
-        end   = (i + 1) * rows_per_drehen
-        result.append(non_orig.iloc[start:end].reset_index(drop=True))
-    return result
+    return [
+        non_orig.iloc[i * rows_per_drehen:(i + 1) * rows_per_drehen].reset_index(drop=True)
+        for i in range(n_drehen)
+    ]
 
-# processing
+
+# ── Per-Drehen processing ────────────────────────────────────────────────────
 
 def build_rows_for_one_drehen(
     signal_file: Path,
-    vb_rows: pd.DataFrame,      # 3 rows from combined xlsx
+    vb_rows: pd.DataFrame,
     meta: RunMeta,
     drehen_index: int,
-    drehen_position: int,       # 0-indexed position within the sample
+    drehen_position: int,
     threshold: float,
     min_segment_length: int,
     min_break_length: int,
@@ -298,9 +201,8 @@ def build_rows_for_one_drehen(
             f"Missing force columns in {signal_file.name}. Detected: {force_cols}"
         )
 
-    n_thirds = len(vb_rows)   # normally 3
+    n_thirds = len(vb_rows)
 
-    # for each axis: segment -> split into thirds -> features
     per_channel: Dict[str, List[Dict[str, float]]] = {}
     for axis in ("fx", "fy", "fz"):
         active = segment_active_signal(
@@ -313,31 +215,23 @@ def build_rows_for_one_drehen(
         if active.size == 0:
             raise ValueError(f"Channel {axis} is empty after segmentation in {signal_file}")
 
-        thirds = split_into_thirds(active)
-
-        # If n_thirds != 3 for some edge case, adapt
-        if n_thirds != 3:
-            thirds = np.array_split(active, n_thirds)
-
-        per_channel[axis] = [
-            compute_features(thirds[i], prefix=axis)
-            for i in range(n_thirds)
-        ]
+        thirds = split_into_thirds(active) if n_thirds == 3 else np.array_split(active, n_thirds)
+        per_channel[axis] = [compute_features(thirds[i], prefix=axis) for i in range(n_thirds)]
 
     out_rows: List[dict] = []
     for i in range(n_thirds):
         row = {
-            "Sample_ID":         meta.sample_id,
-            "Reihe":             meta.reihe,
-            "Schichtsystem":     meta.schichtsystem,
-            "Run_ID":            meta.run_id_int,
-            "Tool_Sample_Code":  meta.sample_code,
-            "Signal_File":       signal_file.name,
-            "Drehen_Index":      drehen_index,
-            "Drehen_Position":   drehen_position + 1,   # 1-indexed
-            "Third_In_Drehen":   i + 1,                 # 1, 2, or 3
-            "Schnittweg_m":      float(vb_rows.iloc[i]["cutting_length_m"]),
-            "VB_um":             float(vb_rows.iloc[i]["VB_fit_um"]),
+            "Sample_ID":        meta.sample_id,
+            "Reihe":            meta.reihe,
+            "Schichtsystem":    meta.schichtsystem,
+            "Run_ID":           meta.run_id_int,
+            "Tool_Sample_Code": meta.sample_code,
+            "Signal_File":      signal_file.name,
+            "Drehen_Index":     drehen_index,
+            "Drehen_Position":  drehen_position + 1,
+            "Third_In_Drehen":  i + 1,
+            "Schnittweg_m":     float(vb_rows.iloc[i]["cutting_length_m"]),
+            "VB_um":            float(vb_rows.iloc[i]["VB_fit_um"]),
         }
         for axis in ("fx", "fy", "fz"):
             row.update(per_channel[axis][i])
@@ -345,7 +239,8 @@ def build_rows_for_one_drehen(
 
     return pd.DataFrame(out_rows)
 
-# main pipeline
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def build_feature_matrix(
     runs_root: Path,
@@ -361,16 +256,14 @@ def build_feature_matrix(
     if not run_dirs:
         raise FileNotFoundError(f"No run folders found in {runs_root}")
 
-    print(f"Loading combined VB xlsx: {combined_vb_xlsx}")
+    print(f"Loading VB file: {combined_vb_xlsx}")
     combined_vb = load_combined_vb(combined_vb_xlsx)
 
     vb_groups: Dict[Tuple[int, str, str], pd.DataFrame] = {}
-    for (reihe, system, sid), grp in combined_vb.groupby(
-        ["Reihe", "Schichtsystem", "Sample_ID"]
-    ):
-        vb_groups[(int(reihe), str(system), str(sid))] = grp.sort_values(
-            "cutting_length_m"
-        ).reset_index(drop=True)
+    for (reihe, system, sid), grp in combined_vb.groupby(["Reihe", "Schichtsystem", "Sample_ID"]):
+        vb_groups[(int(reihe), str(system), str(sid))] = (
+            grp.sort_values("cutting_length_m").reset_index(drop=True)
+        )
 
     all_rows: List[pd.DataFrame] = []
     warnings: List[str] = []
@@ -378,9 +271,7 @@ def build_feature_matrix(
     for meta in run_dirs:
         sample_df = vb_groups.get(meta.vb_key)
         if sample_df is None:
-            warnings.append(
-                f"Skipped {meta.run_dir.name}: no VB data for key {meta.vb_key}."
-            )
+            warnings.append(f"Skipped {meta.run_dir.name}: no VB data for key {meta.vb_key}.")
             continue
 
         drehen_dirs = find_drehen_dirs(meta)
@@ -397,10 +288,9 @@ def build_feature_matrix(
             try:
                 vb_rows = all_vb_rows[pos]
                 if len(vb_rows) == 0:
-                    raise ValueError("No VB rows found for this Drehen (not enough interpolated points).")
-
+                    raise ValueError("No VB rows for this Drehen.")
                 signal_file = find_signal_file(drehen_dir)
-                print(f"      Processing {signal_file.name} ...")
+                print(f"  Processing {signal_file.name} ...")
                 one = build_rows_for_one_drehen(
                     signal_file=signal_file,
                     vb_rows=vb_rows,
@@ -413,12 +303,9 @@ def build_feature_matrix(
                     trim_samples=trim_samples,
                 )
                 run_frames.append(one)
-                print(
-                    f"OK  {meta.run_dir.name} | Drehen {drehen_idx:02d} "
-                    f"| VB={vb_rows['VB_fit_um'].iloc[-1]:.1f}µm"
-                )
+                print(f"  OK  Drehen {drehen_idx:02d} | VB={vb_rows['VB_fit_um'].iloc[-1]:.1f} µm")
             except Exception as exc:
-                msg = f"Skipped {meta.run_dir.name} / {drehen_dir.name}: {exc}"
+                msg = f"Skipped {meta.run_dir.name}/{drehen_dir.name}: {exc}"
                 warnings.append(msg)
                 print(f"  WARN {msg}")
 
@@ -456,36 +343,30 @@ def build_feature_matrix(
         warn_path.write_text("\n".join(warnings), encoding="utf-8")
         print(f"\nWarnings written to: {warn_path}")
 
-    print(f"\nSaved feature matrix: {output_path}")
-    print(f"Shape: {final_df.shape}")
+    print(f"\nSaved: {output_path}  |  Shape: {final_df.shape}")
     return final_df
 
-# entry point
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Build a 3-rows-per-Drehen NN feature matrix from raw force signal files."
+        description="Build a 3-rows-per-Drehen feature matrix from raw force signal files."
     )
-    p.add_argument(
-        "--runs_root", type=str, required=True,
-        help="Root directory containing the run folders (spp2402_abr_wp_* subdirectories).",
-    )
-    p.add_argument(
-        "--combined_vb_xlsx", type=str, required=True,
-        help="Path to VB_interpolated_all_samples_combined.xlsx.",
-    )
-    p.add_argument(
-        "--output", type=str, default="FEATURE_MATRIX_SIGNAL_THIRDS.xlsx",
-        help="Output path for the feature matrix (.xlsx or .csv). Default: FEATURE_MATRIX_SIGNAL_THIRDS.xlsx",
-    )
+    p.add_argument("--runs_root",        type=str, required=True,
+                   help="Root directory containing the run folders.")
+    p.add_argument("--combined_vb_xlsx", type=str, required=True,
+                   help="Path to the interpolated VB Excel file.")
+    p.add_argument("--output",           type=str, default="FEATURE_MATRIX_SIGNAL_THIRDS.xlsx",
+                   help="Output path (.xlsx or .csv).")
     p.add_argument("--threshold",          type=float, default=150.0,
-                   help="Force threshold (N) for active-cutting detection. Default: 150.0")
+                   help="Force threshold (N) for active-cutting detection.")
     p.add_argument("--min_segment_length", type=int,   default=5000,
-                   help="Minimum samples for a valid cutting segment. Default: 5000")
+                   help="Minimum samples for a valid cutting segment.")
     p.add_argument("--min_break_length",   type=int,   default=100,
-                   help="Gaps shorter than this (samples) are bridged. Default: 100")
+                   help="Gaps shorter than this (samples) are bridged.")
     p.add_argument("--trim_samples",       type=int,   default=1600,
-                   help="Samples removed from each segment edge. Default: 1600")
+                   help="Samples removed from each segment edge.")
     return p.parse_args()
 
 
