@@ -1,6 +1,6 @@
 # Physics-Constrained Neural Network for Tool Wear Prediction
 
-A two-stage pipeline for predicting tool flank wear (VB) during CNC turning from force sensor signals. The model enforces monotonically increasing wear by construction using a physics-constrained architecture with phase-aware loss terms.
+A two-stage pipeline for predicting tool flank wear (VB) during CNC turning from force sensor signals. The model enforces monotonically increasing wear by construction using a physics-constrained architecture with wear-curve phase-aware loss terms.
 
 For a full explanation of the methodology, signal processing, model architecture, and results, see the project report (PDF).
 
@@ -29,14 +29,14 @@ Raw force signal CSVs
         ▼
 [NN_PhysicsConstrained_PhaseAware_v1.py]
   Trains a physics-constrained MLP that predicts wear
-  increments via shifted softplus — monotonicity guaranteed
+  increments via shifted softplus - monotonicity guaranteed
   by architecture, not post-processing.
         │
         ▼
   Predictions + SHAP feature importance
 ```
 
-**Stage 1 — build the feature matrix:**
+**Stage 1: build the feature matrix:**
 ```bash
 python build_feature_matrix.py \
     --runs_root /path/to/run/folders \
@@ -44,7 +44,7 @@ python build_feature_matrix.py \
     --output FEATURE_MATRIX.xlsx
 ```
 
-**Stage 2 — train the model:**
+**Stage 2: train the model:**
 ```bash
 python NN_PhysicsConstrained_PhaseAware_v1.py \
     --data FEATURE_MATRIX.xlsx \
