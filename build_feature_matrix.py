@@ -35,7 +35,7 @@ from signal_processing import (
 )
 
 
-# ── Folder naming patterns ────────────────────────────────────────────────────
+# folder naming
 
 OUTER_RUN_RE = re.compile(
     r"^spp2402_abr_wp_(?P<prefix>\d+)-(?P<reihe>Reihe-\d+)-(?P<system>(?:Mono|Bilay)-\d+)"
@@ -49,7 +49,7 @@ INNER_PC_RE = re.compile(
 DREHEN_RE = re.compile(r"^(?P<prefix>\d+)-Drehen(?P<idx>\d+)$", re.IGNORECASE)
 
 
-# ── Run metadata ─────────────────────────────────────────────────────────────
+# run metadata
 
 @dataclass
 class RunMeta:
@@ -70,7 +70,7 @@ class RunMeta:
         return (self.reihe_int, self.schichtsystem, self.sample_code)
 
 
-# ── Folder discovery ──────────────────────────────────────────────────────────
+# folder discovery
 
 def find_run_dirs(runs_root: Path) -> List[RunMeta]:
     out: List[RunMeta] = []
@@ -149,7 +149,7 @@ def find_signal_file(drehen_dir: Path) -> Path:
     return ranked[0][1]
 
 
-# ── VB lookup ─────────────────────────────────────────────────────────────────
+# VB lookup
 
 def load_combined_vb(path: Path) -> pd.DataFrame:
     """
@@ -180,7 +180,7 @@ def get_all_drehen_vb_rows(
     ]
 
 
-# ── Per-Drehen processing ────────────────────────────────────────────────────
+# per-cutting-pass
 
 def build_rows_for_one_drehen(
     signal_file: Path,
@@ -240,7 +240,7 @@ def build_rows_for_one_drehen(
     return pd.DataFrame(out_rows)
 
 
-# ── Main pipeline ─────────────────────────────────────────────────────────────
+# main
 
 def build_feature_matrix(
     runs_root: Path,
@@ -346,8 +346,6 @@ def build_feature_matrix(
     print(f"\nSaved: {output_path}  |  Shape: {final_df.shape}")
     return final_df
 
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
