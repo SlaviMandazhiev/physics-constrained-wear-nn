@@ -22,7 +22,7 @@ from scipy.fft import rfft
 from scipy.stats import kurtosis, skew
 
 
-# ── File I/O ────────────────────────────────────────────────────────────────
+# file load
 
 def read_table(path: Path) -> pd.DataFrame:
     """Load a CSV or Excel file into a DataFrame."""
@@ -34,7 +34,7 @@ def read_table(path: Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported file type: {path}")
 
 
-# ── Column detection ─────────────────────────────────────────────────────────
+# column detection
 
 def _normalize_text(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(s).strip().lower())
@@ -59,7 +59,7 @@ def detect_force_columns(df: pd.DataFrame) -> Dict[str, str]:
     return out
 
 
-# ── Signal segmentation ──────────────────────────────────────────────────────
+# signal segmentation
 
 def segment_active_signal(
     signal: np.ndarray,
@@ -89,7 +89,7 @@ def segment_active_signal(
 
     Returns
     -------
-    1-D float array — the concatenated clean signal, or empty array if nothing survives.
+    1-D float array: the concatenated clean signal, or empty array if nothing survives.
     """
     signal = np.asarray(signal, dtype=float)
     signal = signal[np.isfinite(signal)]
@@ -126,7 +126,7 @@ def split_into_thirds(signal: np.ndarray) -> List[np.ndarray]:
     return [signal[b[i]:b[i + 1]] for i in range(3)]
 
 
-# ── Feature computation ──────────────────────────────────────────────────────
+# feature calculation
 
 def _safe_skew(x: np.ndarray) -> float:
     if x.size < 3 or np.allclose(x, x[0]):
@@ -151,12 +151,10 @@ def compute_features(x: np.ndarray, prefix: str) -> Dict[str, float]:
       area_under_curve (trapezoidal), fft_energy (sum of squared FFT magnitudes).
 
     Parameters
-    ----------
     x : 1-D signal array (must be non-empty).
     prefix : Column name prefix, e.g. 'fx', 'fy', 'fz'.
 
     Returns
-    -------
     Dict mapping '<prefix>_<feature>' to float value.
     """
     x = np.asarray(x, dtype=float)
